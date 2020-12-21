@@ -14,7 +14,7 @@ namespace CentralRepoSumulation
         static async Task Main(string[] args)
         {
             //Console.WriteLine($".Net Core 3.1 = {System.Net.ServicePointManager.DefaultConnectionLimit}");
-            //System.Net.ServicePointManager.DefaultConnectionLimit = Int32.MaxValue;
+            System.Net.ServicePointManager.DefaultConnectionLimit = Int32.MaxValue;
             //System.Net.ServicePointManager.DefaultConnectionLimit = 100;
             Console.WriteLine($".Net Core 3.1 = {System.Net.ServicePointManager.DefaultConnectionLimit}");
             // initialize timer
@@ -27,11 +27,11 @@ namespace CentralRepoSumulation
             // get source
             if (GetSourceAndDest(args, out String source, out String dest))
             {
-                Console.WriteLine($"source: {source}, dest: {dest}");
+                Console.WriteLine($"copying source: {source} to dest: {dest}");
 
                 if (GetBucketNameAndS3Folder(dest, out String bucketName, out String s3Path))
                 {
-                    Console.WriteLine($"bucketName: {bucketName}, s3Path: {s3Path}");
+                    //Console.WriteLine($"bucketName: {bucketName}, s3Path: {s3Path}");
 
                     // create of list of files to upload to S3
                     string[] files = Directory.GetFiles(source, "*.*", SearchOption.AllDirectories);
@@ -60,7 +60,7 @@ namespace CentralRepoSumulation
 
                         UploadFiles(s3Client, uploadRequest);
 
-                        Console.WriteLine($"Processing {info.FullName} on thread {Thread.CurrentThread.ManagedThreadId}");
+                        //Console.WriteLine($"Processing {info.FullName} on thread {Thread.CurrentThread.ManagedThreadId}");
                         //}
                     });
 
@@ -112,7 +112,7 @@ namespace CentralRepoSumulation
             bucketName = String.Empty;
             s3Path = String.Empty;
             // regex to get bucketname and s3Path
-            Regex r = new Regex(@"^(?<proto>\w+)://(?<host>\w+)/(?<path>\w+)",
+            Regex r = new Regex(@"^(?<proto>\w+)://(?<host>.+)/(?<path>\w+)",
                           RegexOptions.None, TimeSpan.FromMilliseconds(150));
 
             // use regex on string
@@ -120,7 +120,7 @@ namespace CentralRepoSumulation
 
             // if successfull set global vars
             if (m.Success)
-            {
+            {                
                 bucketName = m.Result("${host}");
                 s3Path = m.Result("${path}");
                 retval = true;
