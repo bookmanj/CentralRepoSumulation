@@ -1,138 +1,307 @@
-﻿using Amazon.S3;
+﻿using Amazon;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Amazon.S3.Transfer;
+using CommandLine;
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Text.RegularExpressions;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using CsvHelper;
+using System.Text;
 
 namespace CentralRepoSumulation
 {
+    internal class PocData
+    {
+        public string AppName { get; set; }
+        public string AppFiles { get; set; }
+        public string AppFilesSize { get; set; }
+        public string AppFilesDownloadTime { get; set; }
+        public string AppFilesDownloadSpeed { get; set; }
+        public string AppFilesUploadTime { get; set; }
+        public string AppFilesUploadSpeed { get; set; }
+        public string ConcurrentApps { get; set; }
+    }
+
     class Program
     {
-        static async Task Main(string[] args)
+
+        private static readonly RegionEndpoint bucketRegion = RegionEndpoint.USEast1;
+        private const string wildCard = "*.*";
+
+        static void Main(string[] args)
         {
-            //Console.WriteLine($".Net Core 3.1 = {System.Net.ServicePointManager.DefaultConnectionLimit}");
-            System.Net.ServicePointManager.DefaultConnectionLimit = Int32.MaxValue;
-            //System.Net.ServicePointManager.DefaultConnectionLimit = 100;
-            Console.WriteLine($".Net Core 3.1 = {System.Net.ServicePointManager.DefaultConnectionLimit}");
-            // initialize timer
-            var timer = new Stopwatch();
-            timer.Start();
+            Parser.Default.ParseArguments<CommandLineOptions>(args)
+                .WithParsed(opts => DoSomeWork(opts))
+                .WithNotParsed((errs) => HandleParseError(errs));
+        }
+
+
+        private static void DoSomeWork(CommandLineOptions opts)
+        {            
+            // init and start the total stopwatch timer
+            Stopwatch total = new Stopwatch();
+            total.Start();
+
+            // write out all command vars that we will be using
+            Console.WriteLine($"Drive letter: {opts.DriveLetter}, BucketName: {opts.BucketName}," +
+                $" AppName: {opts.AppName}, ConcurrentAppCount: {opts.ConcurrentCount}," +
+                $" DownloadOff: {opts.DownloadOff}, UploadOff: {opts.UploadOff}\n");
+
+            // create poc data list and populate app name
+            List<PocData> pocData = new List<PocData>();
+            foreach (int index in Enumerable.Range(1, opts.ConcurrentCount))
+            {
+                UpdateCsvData(pocData, $"{opts.AppName}-{index}", "", "", "", "", opts.ConcurrentCount.ToString());
+            }
 
             // Create an S3 client object.
-            var s3Client = new AmazonS3Client();
+            var s3Client = new AmazonS3Client(bucketRegion);
 
-            // get source
-            if (GetSourceAndDest(args, out String source, out String dest))
+            if (!opts.DownloadOff)
             {
-                Console.WriteLine($"copying source: {source} to dest: {dest}");
+                // init stopwatch timer and create List<Action>
+                Stopwatch dl = new Stopwatch();
+                List<Action> actions = new List<Action>();
 
-                if (GetBucketNameAndS3Folder(dest, out String bucketName, out String s3Path))
+                // create local cache directory and populate the List<Action> with the DownloadDirectoryAsync method
+                foreach (int index in Enumerable.Range(1, opts.ConcurrentCount))
                 {
-                    //Console.WriteLine($"bucketName: {bucketName}, s3Path: {s3Path}");
+                    // local cache directory
+                    string localCache = $"{opts.DriveLetter}:\\local-cache\\{opts.BucketName}\\{opts.AppName}-{index}";
+                    ManageFolder(localCache);
 
-                    // create of list of files to upload to S3
-                    string[] files = Directory.GetFiles(source, "*.*", SearchOption.AllDirectories);
-
-
-                    //foreach (string currentFile in files)
-                    Parallel.ForEach(files, (currentFile) =>
-                    {
-
-                        FileInfo info = new FileInfo(currentFile);
-                        string fileToBackup = info.FullName; // file to upload
-                        string s3FileName = info.Name;  // fileName - need to add path with file name                   
-
-                        string tempPath = info.DirectoryName.Remove(0, source.Length + 1);
-                        string s3Folder = s3Path + "/" + tempPath;
-
-                        //Console.WriteLine($"fileToBackup: {fileToBackup}, s3FileName: {s3FileName}, bucketName: {bucketName + @"/" + s3Folder}");
-
-                        var uploadRequest = new TransferUtilityUploadRequest
-                        {
-                            FilePath = fileToBackup,
-                            Key = s3FileName,
-                            BucketName = bucketName + @"/" + s3Folder,
-                            CannedACL = S3CannedACL.NoACL // gives the ownler full controll and no-one else
-                        };
-
-                        UploadFiles(s3Client, uploadRequest);
-
-                        //Console.WriteLine($"Processing {info.FullName} on thread {Thread.CurrentThread.ManagedThreadId}");
-                        //}
+                    // populate the List<Action> with the DownloadDirectoryAsync method and output stopwatch elapsed time
+                    actions.Add(() => {
+                        DownloadDirAsync(s3Client, opts.BucketName, "app-init", localCache).Wait();
+                        Console.WriteLine($"Local cache {localCache} - download time: {dl.Elapsed.TotalSeconds}" +
+                            $"\n Transfer speed: {TransferSpeed(pocData, localCache, dl.Elapsed.TotalSeconds, $"{opts.AppName}-{index}", "down")}");
                     });
-
-                    // Get the elapsed time as a TimeSpan value.
-                    TimeSpan ts = timer.Elapsed;
-
-                    // Format and display the TimeSpan value.
-                    string elapsedTime = String.Format("{0:00}:{1:00}:{2:00}.{3:00}",
-                        ts.Hours, ts.Minutes, ts.Seconds,
-                        ts.Milliseconds / 10);
-                    Console.WriteLine("RunTime " + elapsedTime);
                 }
+
+                // start the dowload timer and kick off the DownloadDirectoryAsync method in parallel
+                dl.Start();
+                Parallel.ForEach(actions, new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = opts.ConcurrentCount
+                }, action => action());
+                
+                // addd a line between up and download runs
+                Console.WriteLine("");
+
+                // wait 5 secs before upload
+                System.Threading.Thread.Sleep(5000);
+            }
+
+            if (!opts.UploadOff)
+            {
+                // init stopwatch timer and List<Action> for upload prep
+                Stopwatch ul = new Stopwatch();
+                List<Action> uploadPrepActions = new List<Action>();
+
+                // create local cache directory and populate the List<Action> with the DownloadDirectoryAsync method
+                foreach (int index in Enumerable.Range(1, opts.ConcurrentCount))
+                {
+                    // local cache directory                
+                    string localCache = $"{opts.DriveLetter}:\\local-cache\\{opts.BucketName}\\{opts.AppName}-{index}";
+
+                    // populate the List<Action> with the DownloadDirectoryAsync method and output stopwatch elapsed time
+                    uploadPrepActions.Add(() => {
+                        UploadDirAsync(s3Client, localCache, $"{ opts.BucketName}/{opts.AppName}-{index}").Wait();
+                        Console.WriteLine($"S3 AppDir: {opts.BucketName}/{opts.AppName}-{index} - upload time: {ul.Elapsed.TotalSeconds}" +
+                            $"\n Transfer speed: {TransferSpeed(pocData, localCache, ul.Elapsed.TotalSeconds, $"{opts.AppName}-{index}", "up")}");
+                    });
+                }
+
+                // start the dowload timer and kick off the DownloadDirectoryAsync method in parallel
+                ul.Start();
+                Parallel.ForEach(uploadPrepActions, new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = opts.ConcurrentCount
+                }, action => action());               
+            }
+
+            // stop timer and output results
+            total.Stop();
+            Console.WriteLine("\nTotal RunTime " + total.Elapsed.TotalSeconds);
+
+            // write csv
+            WriteCsv(pocData, opts.OutputPath);
+        }
+
+        // s3 upload directory
+        private static async Task UploadDirAsync(IAmazonS3 s3Client, string localDirectory, string s3Path)
+        {
+            try
+            {
+                // create the directoryTransferUtility object
+                var directoryTransferUtility = new TransferUtility(s3Client);                
+                
+                // Upload a directory
+                //await directoryTransferUtility.UploadDirectoryAsync(localDirectory, s3Path, wildCard, SearchOption.AllDirectories);
+                await directoryTransferUtility.UploadDirectoryAsync(localDirectory, s3Path);
+            }
+            catch (AmazonS3Exception e)
+            {
+                Console.WriteLine("Error encountered ***. Message:'{0}' when writing an object", e.Message);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Unknown encountered on server. Message:'{0}' when writing an object", e.Message);
             }
         }
 
-        //  Method to parse the command line
-        private static Boolean GetSourceAndDest(string[] args, out String source, out String dest)
+        
+        // S3 download
+        private static async Task DownloadDirAsync(IAmazonS3 s3Client, string bucketName, string s3Directory, string localDirectory)
         {
-            Boolean retval = false;
-            source = String.Empty;
-            dest = String.Empty;
-            if (args.Length <= 1)
+            try
             {
-                Console.WriteLine("\nNo arguments specified. Please provide the local source directory and S3 destination." +
-                  "\n e.g. <exe> <drive>:\\<folder path> s3://<bucket>/<folder path>" +
-                  "\n S3CreateAndList.exe c:\\s3-temp\app1 s3://crt01/app1");
-                source = String.Empty;
-                dest = String.Empty;
-                retval = false;
+                // create the directoryTransferUtility object
+                var directoryTransferUtility = new TransferUtility(s3Client);
+
+                // download a s3 directory
+                await directoryTransferUtility.DownloadDirectoryAsync(bucketName, s3Directory, localDirectory);
             }
-            else if (args.Length == 2)
+            catch (AmazonS3Exception e)
             {
-                source = args[0];
-                dest = args[1];
-                retval = true;
+                Console.WriteLine("Error encountered ***. Message:'{0}' when writing an object", e.Message);
             }
-            else
+            catch (Exception e)
             {
-                Console.WriteLine("\nToo many arguments specified.");
-                Environment.Exit(1);
-            }
-            return retval;
+                Console.WriteLine("Unknown encountered on server. Message:'{0}' when writing an object", e.Message);
+            }            
         }
 
-        // get the bucketName and S3Path
-        public static Boolean GetBucketNameAndS3Folder(string url, out String bucketName, out String s3Path)
+
+        // manage local cache folder
+        private static void ManageFolder(string path)
         {
-            Boolean retval = false;
-            bucketName = String.Empty;
-            s3Path = String.Empty;
-            // regex to get bucketname and s3Path
-            Regex r = new Regex(@"^(?<proto>\w+)://(?<host>.+)/(?<path>\w+)",
-                          RegexOptions.None, TimeSpan.FromMilliseconds(150));
+            try
+            {
+                // Determine whether the directory exists.
+                if (Directory.Exists(path))
+                {
+                    //Console.WriteLine($"The path {path} exists already.");
+                    return;
+                }
 
-            // use regex on string
-            Match m = r.Match(url);
-
-            // if successfull set global vars
-            if (m.Success)
-            {                
-                bucketName = m.Result("${host}");
-                s3Path = m.Result("${path}");
-                retval = true;
+                // Try to create the directory.
+                DirectoryInfo di = Directory.CreateDirectory(path);
+                Console.WriteLine($"The directory {path} was created successfully at {Directory.GetCreationTime(path)}.");
             }
-            return retval;
+            catch (Exception e)
+            {
+                Console.WriteLine($"The process failed: {e.ToString()}");
+            }
+            finally { }
         }
 
-        // file upload
-        private static async Task UploadFiles(IAmazonS3 s3Client, TransferUtilityUploadRequest uploadRequest)
+
+        // calulate transfer speed
+        private static float TransferSpeed(List<PocData> pocData, string dirPath, double seconds, string appName, string type)
         {
-            TransferUtility utility = new TransferUtility(s3Client);
-            utility.Upload(uploadRequest);
+            DirectoryInfo info = new DirectoryInfo(dirPath);
+            long totalSize = info.EnumerateFiles().Sum(file => file.Length);
+
+            float result = (float)(ConvertBytesToMegabytes(totalSize) / Convert.ToDouble(seconds));
+
+            if (type == "up") { UpdateCsvData(pocData, appName, "", "", seconds.ToString(), result.ToString()); }
+
+            if (type == "down") { UpdateCsvData(pocData, appName, seconds.ToString(), result.ToString(), "", ""); }
+
+            return result;
+        }
+
+
+        private static double ConvertBytesToMegabytes(long bytes)
+        {
+            return (bytes / 1024f) / 1024f;
+        }
+
+
+        // populate csv data
+        private static void UpdateCsvData(List<PocData> pocData, string appName, string dlTime = "", string dlSpeed = "", string ulTime = "", string ulSpeed = "", string concurrentApps = "")
+        {
+            if (!String.IsNullOrEmpty(appName))
+            {
+                if (String.IsNullOrEmpty(dlTime) && String.IsNullOrEmpty(ulTime))
+                {
+                    pocData.Add(new PocData()
+                    {
+                        AppName = appName,
+                        AppFiles = "50 1MB + 50 10MB files",
+                        AppFilesSize = "550MB",
+                        AppFilesDownloadTime = "",
+                        AppFilesDownloadSpeed = "",
+                        AppFilesUploadTime = "",
+                        AppFilesUploadSpeed = "",
+                        ConcurrentApps = concurrentApps
+                    });
+                }
+                else if (!String.IsNullOrEmpty(dlTime) && String.IsNullOrEmpty(ulTime))
+                {
+                    foreach (var data in pocData.Where(w => w.AppName == appName))
+                    {
+                        data.AppFilesDownloadTime = dlTime;
+                        data.AppFilesDownloadSpeed = dlSpeed;
+                    }
+                }
+                else if (String.IsNullOrEmpty(dlTime) && !String.IsNullOrEmpty(ulTime))
+                {
+                    foreach (var data in pocData.Where(w => w.AppName == appName))
+                    {
+                        data.AppFilesUploadTime = ulTime;
+                        data.AppFilesUploadSpeed = ulSpeed;
+                    }
+                }
+            }           
+        }
+
+
+        // write csv
+        public static void WriteCsv(List<PocData> pocData, string outputPath)
+        {
+            using (var mem = new MemoryStream())
+            using (var writer = new StreamWriter(mem))
+            //using (var csvWriter = new CsvWriter(writer, System.Globalization.CultureInfo.CurrentCulture))
+            using (var csvWriter = new CsvWriter(writer, System.Globalization.CultureInfo.CurrentCulture))
+            {
+                csvWriter.Configuration.Delimiter = ",";
+                csvWriter.Configuration.HasHeaderRecord = true;
+                csvWriter.Configuration.AutoMap<PocData>();
+
+                csvWriter.WriteHeader<PocData>();
+                csvWriter.NextRecord();
+                csvWriter.WriteRecords(pocData);
+
+                writer.Flush();
+                var result = Encoding.UTF8.GetString(mem.ToArray());
+                //Console.WriteLine(result);
+
+                if (File.Exists(outputPath))
+                {
+                    using (System.IO.StreamWriter file =
+                        new System.IO.StreamWriter(outputPath, true))
+                    {
+                        file.Write(result);
+                    }
+                }
+                else { System.IO.File.WriteAllText(outputPath, result); }
+                
+            }
+        }
+
+
+        // handle commandline exception
+        private static void HandleParseError(IEnumerable errs)
+        {
+            Console.WriteLine("Command Line parameters provided were not valid!");
         }
     }
 }
